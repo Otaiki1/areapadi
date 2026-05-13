@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS sellers (
     pro_expires_at TIMESTAMPTZ,
     onboarding_complete BOOLEAN DEFAULT FALSE,
     onboarding_step VARCHAR(100),
+    opening_time VARCHAR(20),
+    closing_time VARCHAR(20),
+    operating_days TEXT[],
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );

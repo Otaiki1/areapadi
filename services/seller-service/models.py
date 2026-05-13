@@ -30,6 +30,9 @@ class Seller(Base):
     pro_expires_at = Column(TIMESTAMP(timezone=True))
     onboarding_complete = Column(Boolean, default=False)
     onboarding_step = Column(String(100))
+    opening_time = Column(String(20))
+    closing_time = Column(String(20))
+    operating_days = Column(ARRAY(Text))
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 

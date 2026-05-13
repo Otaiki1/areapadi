@@ -59,6 +59,9 @@ def seller_to_dict(seller: Seller) -> dict:
         "total_reviews": seller.total_reviews or 0,
         "onboarding_complete": seller.onboarding_complete,
         "onboarding_step": seller.onboarding_step,
+        "opening_time": seller.opening_time,
+        "closing_time": seller.closing_time,
+        "operating_days": seller.operating_days or [],
     }
 
 
@@ -91,6 +94,9 @@ async def create_seller(req: CreateSellerRequest, db: AsyncSession = Depends(get
         food_categories=req.food_categories,
         location=point,
         address_text=req.address_text,
+        opening_time=req.opening_time,
+        closing_time=req.closing_time,
+        operating_days=req.operating_days or [],
     )
     db.add(seller)
     await db.flush()

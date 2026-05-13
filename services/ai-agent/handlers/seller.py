@@ -5,6 +5,7 @@ Onboarding stages:
   new_seller_name      → business name
   new_seller_category  → food categories (comma-separated)
   new_seller_location  → GPS pin — stored in DB with reverse-geocoded address
+  new_seller_hours     → opening/closing time and operating days
   new_seller_menu      → add at least one menu item before going live
 
 Active seller stages:
@@ -14,6 +15,7 @@ Active seller stages:
   seller_adding_item   → looping item entry
   seller_removing_item → waiting for item number to delete
   seller_editing_item  → waiting for item number then new price
+  seller_updating_hours → waiting for new hours input
 """
 from __future__ import annotations
 import re
@@ -58,6 +60,10 @@ async def handle_seller_message(
         await _step_location(state, message, phone, wa)
         return
 
+    if stage == "new_seller_hours":
+        await _step_hours(state, message, phone, wa)
+        return
+
     if stage == "new_seller_menu":
         await _step_menu(state, message, phone, wa)
         return
@@ -82,6 +88,10 @@ async def handle_seller_message(
 
     if stage == "seller_editing_item":
         await _handle_editing_item(state, message, phone, wa)
+        return
+
+    if stage == "seller_updating_hours":
+        await _handle_updating_hours(state, message, phone, wa)
         return
 
     # ── Active seller ─────────────────────────────────────────────────────────
@@ -116,7 +126,7 @@ async def _step_name(state, message, phone, wa):
     await save_conversation_state(state)
     await wa.send_text(
         phone,
-        f"Great name! *Step 2 of 4*\n\n"
+        f"Great name! *Step 2 of 5*\n\n"
         f"What types of food do you sell, {name}?\n\n"
         "List them separated by commas:\n"
         "Example: *Jollof Rice, Fried Rice, Grilled Chicken, Shawarma*",
@@ -143,7 +153,7 @@ async def _step_category(state, message, phone, wa):
     cats_display = ", ".join(categories)
     await wa.send_text(
         phone,
-        f"Selling: *{cats_display}*\n\n*Step 3 of 4*\n\n"
+        f"Selling: *{cats_display}*\n\n*Step 3 of 5*\n\n"
         "Share your *shop or kitchen location* so buyers near you can find you.\n\n"
         "Tap the attachment icon → Location → Send your current location.",
     )
@@ -174,11 +184,69 @@ async def _step_location(state, message, phone, wa):
     state.onboarding_data = state.onboarding_data or {}
     state.onboarding_data["lat"] = lat
     state.onboarding_data["lng"] = lng
-    state.stage = "new_seller_menu"
+    state.stage = "new_seller_hours"
     await save_conversation_state(state)
     await wa.send_text(
         phone,
-        "Location saved! *Step 4 of 4*\n\n"
+        "Location saved! *Step 4 of 5*\n\n"
+        "What are your *opening hours and operating days*?\n\n"
+        "Send it like this:\n"
+        "*8am - 10pm, Mon - Sat*\n\n"
+        "Or choose a common pattern:\n"
+        "• *8am - 10pm, Everyday*\n"
+        "• *9am - 8pm, Mon - Fri*\n"
+        "• *7am - 9pm, Weekdays*\n"
+        "• *10am - 6pm, Weekends*",
+    )
+
+
+async def _step_hours(state, message, phone, wa):
+    text = (message.text or "").strip()
+    if not text:
+        await wa.send_text(
+            phone,
+            "Please send your opening hours and days.\n\n"
+            "Example: *8am - 10pm, Mon - Sat*\n\n"
+            "Or send *skip* to set hours later.",
+        )
+        return
+
+    if text.lower() == "skip":
+        state.stage = "new_seller_menu"
+        await save_conversation_state(state)
+        await _prompt_menu(phone, wa)
+        return
+
+    opening_time, closing_time, operating_days, error = _parse_hours(text)
+    if error:
+        await wa.send_text(
+            phone,
+            f"{error}\n\n"
+            "Example: *8am - 10pm, Mon - Sat*\n"
+            "Or send *skip* to set hours later.",
+        )
+        return
+
+    state.onboarding_data = state.onboarding_data or {}
+    state.onboarding_data["opening_time"] = opening_time
+    state.onboarding_data["closing_time"] = closing_time
+    state.onboarding_data["operating_days"] = operating_days
+    state.stage = "new_seller_menu"
+    await save_conversation_state(state)
+
+    days_display = ", ".join(operating_days) if operating_days else "—"
+    await wa.send_text(
+        phone,
+        f"Hours set: *{opening_time} – {closing_time}*\n"
+        f"Days: *{days_display}*\n\n"
+        "*Step 5 of 5*",
+    )
+    await _prompt_menu(phone, wa)
+
+
+async def _prompt_menu(phone, wa):
+    await wa.send_text(
+        phone,
         "Now add your menu items. Send each item on its own line like this:\n\n"
         "*Jollof Rice — 1500*\n"
         "*Grilled Chicken — 2500*\n"
@@ -276,6 +344,17 @@ async def _handle_active(state, message, phone, wa):
 
     if any(p in text for p in ("my store", "store info", "profile", "update store", "edit store")):
         await _show_store_info(state, phone, wa)
+        return
+
+    if any(p in text for p in ("update hours", "change hours", "my hours", "opening hours", "set hours")):
+        state.stage = "seller_updating_hours"
+        await save_conversation_state(state)
+        await wa.send_text(
+            phone,
+            "Send your new opening hours and days.\n\n"
+            "Example: *8am - 10pm, Mon - Sat*\n\n"
+            "Or send *cancel* to go back.",
+        )
         return
 
     if text in ("help", "?", "hi", "hello", "menu options"):
@@ -605,6 +684,57 @@ async def _handle_editing_item(state, message, phone, wa):
         await wa.send_text(phone, "Something went wrong. Please try again.")
 
 
+async def _handle_updating_hours(state, message, phone, wa):
+    text = (message.text or "").strip()
+
+    if text.lower() in ("cancel", "back", "stop"):
+        state.stage = "seller_active"
+        await save_conversation_state(state)
+        await wa.send_text(phone, "Cancelled.")
+        return
+
+    opening_time, closing_time, operating_days, error = _parse_hours(text)
+    if error:
+        await wa.send_text(
+            phone,
+            f"{error}\n\n"
+            "Example: *8am - 10pm, Mon - Sat*\n"
+            "Or send *cancel* to go back.",
+        )
+        return
+
+    seller_id = (state.onboarding_data or {}).get("seller_id")
+    if not seller_id:
+        await wa.send_text(phone, "Could not find your seller profile. Please contact support.")
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.patch(
+                f"{SELLER_SERVICE_URL}/sellers/{seller_id}",
+                json={
+                    "opening_time": opening_time,
+                    "closing_time": closing_time,
+                    "operating_days": operating_days,
+                },
+            )
+        if resp.status_code == 200:
+            state.stage = "seller_active"
+            await save_conversation_state(state)
+            days_display = ", ".join(operating_days) if operating_days else "—"
+            await wa.send_text(
+                phone,
+                f"Hours updated!\n\n"
+                f"Open: *{opening_time} – {closing_time}*\n"
+                f"Days: *{days_display}*",
+            )
+        else:
+            await wa.send_text(phone, "Could not update hours. Please try again.")
+    except Exception as exc:
+        logger.error("update_hours_failed", error=str(exc))
+        await wa.send_text(phone, "Something went wrong. Please try again.")
+
+
 # ── View helpers ──────────────────────────────────────────────────────────────
 
 async def _show_menu(state, phone, wa):
@@ -684,15 +814,22 @@ async def _show_store_info(state, phone, wa):
     rating = s.get("rating", 0)
     orders = s.get("total_orders", 0)
 
+    open_t = s.get("opening_time") or "—"
+    close_t = s.get("closing_time") or "—"
+    days   = ", ".join(s.get("operating_days") or []) or "—"
+    hours_line = f"Hours: *{open_t} – {close_t}*\nDays: *{days}*\n"
+
     await wa.send_text(
         phone,
         f"*{s['business_name']}*\n"
         f"Status: {status}\n"
         f"Food types: {cats}\n"
         f"Address: {addr}\n"
+        f"{hours_line}"
         f"Rating: ★{float(rating):.1f}\n"
         f"Total orders: {orders}\n\n"
         "Reply *open* or *close* to change status.\n"
+        "Reply *update hours* to change your schedule.\n"
         "Reply *add item* / *remove item* / *edit item* to manage your menu.",
     )
 
@@ -720,7 +857,8 @@ async def _send_help(state, phone, wa):
         "*Store*\n"
         "• *open* — start receiving orders\n"
         "• *close* — pause your store\n"
-        "• *my store* — view store info\n\n"
+        "• *my store* — view store info\n"
+        "• *update hours* — change opening hours & days\n\n"
         "*Menu*\n"
         "• *my menu* — view all items\n"
         "• *add item* — add a new item\n"
@@ -808,12 +946,15 @@ async def _complete_onboarding(state, phone, wa):
             seller_resp = await client.post(
                 f"{SELLER_SERVICE_URL}/sellers",
                 json={
-                    "phone_number":   phone,
-                    "business_name":  data.get("business_name", "My Store"),
+                    "phone_number":    phone,
+                    "business_name":   data.get("business_name", "My Store"),
                     "food_categories": data.get("food_categories", []),
                     "latitude":        lat,
                     "longitude":       lng,
                     "address_text":    address_text,
+                    "opening_time":    data.get("opening_time"),
+                    "closing_time":    data.get("closing_time"),
+                    "operating_days":  data.get("operating_days", []),
                 },
             )
 
@@ -938,3 +1079,82 @@ def _validate_item(name: str, price: float) -> str | None:
     if price > MAX_PRICE:
         return f"Price must be ₦{MAX_PRICE:,} or less."
     return None
+
+
+_DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_DAY_ALIASES = {
+    "monday": "Mon", "mon": "Mon",
+    "tuesday": "Tue", "tue": "Tue", "tues": "Tue",
+    "wednesday": "Wed", "wed": "Wed",
+    "thursday": "Thu", "thu": "Thu", "thur": "Thu", "thurs": "Thu",
+    "friday": "Fri", "fri": "Fri",
+    "saturday": "Sat", "sat": "Sat",
+    "sunday": "Sun", "sun": "Sun",
+}
+
+
+def _parse_hours(text: str) -> tuple[str | None, str | None, list[str], str | None]:
+    """
+    Parse '8am - 10pm, Mon - Sat' into (opening_time, closing_time, operating_days, error).
+    Returns (None, None, [], error_string) on failure.
+    Accepts: 'everyday', 'daily', 'all week', 'weekdays', 'weekends',
+             'Mon - Fri', 'Mon, Tue, Wed', range patterns.
+    """
+    text = text.strip()
+
+    # Split on comma into time part and days part
+    parts = [p.strip() for p in text.split(",", 1)]
+    time_part = parts[0]
+    days_part = parts[1] if len(parts) == 2 else ""
+
+    # Parse time range: accept '-', '–', 'to'
+    time_split = re.split(r"\s*(?:–|-|to)\s*", time_part, maxsplit=1)
+    if len(time_split) != 2:
+        return None, None, [], (
+            "I couldn't read the time. Please use format: *8am - 10pm*"
+        )
+
+    opening_time = time_split[0].strip()
+    closing_time = time_split[1].strip()
+
+    if not opening_time or not closing_time:
+        return None, None, [], "Please include both opening and closing time."
+
+    # Parse days
+    operating_days: list[str] = []
+    days_lower = days_part.lower().strip()
+
+    if not days_lower or days_lower in ("everyday", "daily", "all week", "all days", "7 days", "7days"):
+        operating_days = list(_DAY_ORDER)
+    elif days_lower in ("weekdays", "week days", "mon - fri", "mon-fri", "monday - friday"):
+        operating_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    elif days_lower in ("weekends", "week ends", "sat - sun", "sat-sun", "saturday - sunday"):
+        operating_days = ["Sat", "Sun"]
+    else:
+        # Try range: "Mon - Sat"
+        range_match = re.match(r"^(\w+)\s*(?:–|-|to)\s*(\w+)$", days_lower)
+        if range_match:
+            start_key = _DAY_ALIASES.get(range_match.group(1).lower())
+            end_key   = _DAY_ALIASES.get(range_match.group(2).lower())
+            if start_key and end_key:
+                start_i = _DAY_ORDER.index(start_key)
+                end_i   = _DAY_ORDER.index(end_key)
+                if start_i <= end_i:
+                    operating_days = _DAY_ORDER[start_i:end_i + 1]
+                else:
+                    # wraps around (e.g. Fri - Mon)
+                    operating_days = _DAY_ORDER[start_i:] + _DAY_ORDER[:end_i + 1]
+        else:
+            # Try comma-separated list: "Mon, Tue, Wed"
+            tokens = [t.strip().lower() for t in re.split(r"[,\s]+", days_lower) if t.strip()]
+            for token in tokens:
+                day = _DAY_ALIASES.get(token)
+                if day and day not in operating_days:
+                    operating_days.append(day)
+
+    if not operating_days:
+        return None, None, [], (
+            "I couldn't read the days. Try: *Mon - Sat*, *Everyday*, or *Weekdays*"
+        )
+
+    return opening_time, closing_time, operating_days, None

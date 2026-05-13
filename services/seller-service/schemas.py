@@ -13,6 +13,9 @@ class CreateSellerRequest(BaseModel):
     latitude: float
     longitude: float
     address_text: str | None = None
+    opening_time: str | None = None
+    closing_time: str | None = None
+    operating_days: list[str] = []
 
 
 class UpdateSellerRequest(BaseModel):
@@ -22,6 +25,9 @@ class UpdateSellerRequest(BaseModel):
     address_text: str | None = None
     onboarding_step: str | None = None
     onboarding_complete: bool | None = None
+    opening_time: str | None = None
+    closing_time: str | None = None
+    operating_days: list[str] | None = None
 
 
 class AvailabilityRequest(BaseModel):
