@@ -199,6 +199,8 @@ async def _generate_and_store_embedding(item_id: str, text: str) -> None:
     try:
         from shared.db import AsyncSessionLocal
         embedding = await generate_embedding(text)
+        if embedding is None:
+            return  # No API key or call failed — skip silently
         async with AsyncSessionLocal() as session:
             result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
             item = result.scalar_one_or_none()

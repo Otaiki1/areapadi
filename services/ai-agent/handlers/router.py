@@ -11,8 +11,6 @@ from shared.db import AsyncSessionLocal
 from shared.whatsapp_client import get_whatsapp_client
 from shared.logger import get_logger
 
-from claude_client import call_claude_json, HAIKU
-from prompts import ROLE_DETECTION
 from handlers.buyer import handle_buyer_message
 from handlers.seller import handle_seller_message
 from handlers.rider import handle_rider_message
@@ -49,22 +47,16 @@ async def route_message(message: MessagePayload) -> None:
 
 
 async def _hydrate_from_db(state: ConversationState, message: MessagePayload) -> None:
-    """Check DB for existing buyer/seller/rider and restore state if found."""
+    """Check DB for existing buyer/seller/rider and restore state if found.
+
+    Sellers are checked before buyers so that a phone number registered as a
+    seller always lands in the seller flow, even if it also has a stale buyer
+    row from early testing.
+    """
     phone = message.phone_number
     try:
         async with AsyncSessionLocal() as session:
-            # Check buyers
-            buyer_row = (await session.execute(
-                sa_text("SELECT id FROM buyers WHERE phone_number = :p LIMIT 1"),
-                {"p": phone},
-            )).fetchone()
-            if buyer_row:
-                state.user_role = "buyer"
-                state.stage = "idle" if state.location_lat else "awaiting_location"
-                await save_conversation_state(state)
-                return
-
-            # Check sellers
+            # Check sellers first — seller role takes priority
             seller_row = (await session.execute(
                 sa_text("SELECT id, onboarding_complete, onboarding_step FROM sellers WHERE phone_number = :p LIMIT 1"),
                 {"p": phone},
@@ -89,6 +81,27 @@ async def _hydrate_from_db(state: ConversationState, message: MessagePayload) ->
                 await save_conversation_state(state)
                 return
 
+            # Check buyers last — also restore their saved location
+            buyer_row = (await session.execute(
+                sa_text("""
+                    SELECT id,
+                           ST_Y(location::geometry) AS lat,
+                           ST_X(location::geometry) AS lng
+                    FROM buyers WHERE phone_number = :p LIMIT 1
+                """),
+                {"p": phone},
+            )).fetchone()
+            if buyer_row:
+                state.user_role = "buyer"
+                if buyer_row[1] is not None:
+                    state.location_lat = float(buyer_row[1])
+                    state.location_lng = float(buyer_row[2])
+                    state.stage = "idle"
+                else:
+                    state.stage = "awaiting_location"
+                await save_conversation_state(state)
+                return
+
     except Exception as exc:
         logger.error("db_hydration_failed", error=str(exc))
 
@@ -98,30 +111,58 @@ async def _handle_new_user(state: ConversationState, message: MessagePayload) ->
     wa = get_whatsapp_client()
     phone = state.phone_number
 
-    # Greet if they sent something unintelligible (image, location, etc.)
+    # Handle role-selection button taps
+    role_map = {"role_buyer": "buyer", "role_seller": "seller", "role_rider": "rider"}
+    if message.interactive_id in role_map:
+        message.text = {"role_buyer": "1", "role_seller": "2", "role_rider": "3"}[message.interactive_id]
+
+    # Greet if no usable text (image, location, unrecognised button, etc.)
     if not message.text:
-        await wa.send_text(
+        await wa.send_interactive_buttons(
             phone,
-            "Welcome to Areapadi! Are you here to:\n1. Order food\n2. Sell food\n3. Deliver food\n\nJust reply with 1, 2, or 3.",
+            "Welcome to Areapadi!\n\nHow can I help you?",
+            buttons=[
+                {"id": "role_buyer",  "title": "Order food"},
+                {"id": "role_seller", "title": "Sell food"},
+                {"id": "role_rider",  "title": "Deliver food"},
+            ],
         )
         return
 
-    # Quick numeric shortcuts
-    text = message.text.strip()
+    text = message.text.strip().lower()
+
+    # Numeric shortcuts
     if text == "1":
-        role, reply = "buyer", "Welcome! Let's get you some food. Share your location so I can find sellers near you."
+        role = "buyer"
     elif text == "2":
-        role, reply = "seller", "Welcome! Let's set up your store on Areapadi. What is your business name?"
+        role = "seller"
     elif text == "3":
-        role, reply = "rider", "Welcome! Let's get you registered as a rider. What is your full name?"
+        role = "rider"
+    # Keyword detection
+    elif any(w in text for w in ("order", "food", "eat", "hungry", "buy", "customer")):
+        role = "buyer"
+    elif any(w in text for w in ("sell", "vendor", "kitchen", "cook", "store", "shop")):
+        role = "seller"
+    elif any(w in text for w in ("deliver", "rider", "dispatch", "driver", "bike")):
+        role = "rider"
     else:
-        parsed = await call_claude_json(
-            ROLE_DETECTION,
-            f"User's first message: {message.text}",
-            model=HAIKU,
+        # Can't determine — ask them to pick
+        await wa.send_interactive_buttons(
+            phone,
+            "Welcome to Areapadi! 🍜\n\nHow can I help you?",
+            buttons=[
+                {"id": "role_buyer",  "title": "Order food"},
+                {"id": "role_seller", "title": "Sell food"},
+                {"id": "role_rider",  "title": "Deliver food"},
+            ],
         )
-        role = parsed.get("role", "buyer")
-        reply = parsed.get("reply_text", "Welcome to Areapadi!")
+        return
+
+    reply = {
+        "buyer":  "Welcome! Share your location so I can find food sellers near you.",
+        "seller": "Welcome! Let's set up your store. What is your business name?",
+        "rider":  "Welcome! Let's get you registered as a rider. What is your full name?",
+    }[role]
 
     state.user_role = role
     if role == "buyer":

@@ -1,7 +1,9 @@
 version: "3.9"
 services:
   postgres:
-    image: postgis/postgis:15-3.3
+    build:
+      context: .
+      dockerfile: postgres.Dockerfile
     container_name: areapadi_postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-areapadi}
@@ -48,6 +50,90 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+
+  gateway:
+    build: ../gateway
+    container_name: areapadi_gateway
+    ports:
+      - "8000:8000"
+    env_file: ../.env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  ai-agent:
+    build: ../services/ai-agent
+    container_name: areapadi_ai_agent
+    ports:
+      - "8001:8001"
+    env_file: ../.env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  seller-service:
+    build: ../services/seller-service
+    container_name: areapadi_seller_service
+    ports:
+      - "8002:8002"
+    env_file: ../.env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  order-service:
+    build: ../services/order-service
+    container_name: areapadi_order_service
+    ports:
+      - "8003:8003"
+    env_file: ../.env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  rider-dispatch:
+    build: ../services/rider-dispatch
+    container_name: areapadi_rider_dispatch
+    ports:
+      - "8004:8004"
+    env_file: ../.env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  rating-engine:
+    build: ../services/rating-engine
+    container_name: areapadi_rating_engine
+    ports:
+      - "8005:8005"
+    env_file: ../.env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  geo-service:
+    build: ../services/geo-service
+    container_name: areapadi_geo_service
+    ports:
+      - "8006:8006"
+    env_file: ../.env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  payment-service:
+    build: ../services/payment-service
+    container_name: areapadi_payment_service
+    ports:
+      - "8007:8007"
+    env_file: ../.env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
 
 volumes:
   postgres_data:

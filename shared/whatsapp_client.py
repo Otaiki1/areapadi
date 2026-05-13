@@ -9,16 +9,24 @@ GRAPH_API_BASE = "https://graph.facebook.com/v19.0"
 
 
 class WhatsAppClient:
-    """Unified WhatsApp Cloud API client used by all services."""
+    """
+    Unified WhatsApp Cloud API client.
+    Credentials are read from env on every call so a token refresh
+    in .env is picked up without restarting any service.
+    """
 
-    def __init__(self) -> None:
-        self.phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-        self.access_token = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
-        self.base_url = f"{GRAPH_API_BASE}/{self.phone_number_id}/messages"
+    def _phone_number_id(self) -> str:
+        return os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+
+    def _base_url(self) -> str:
+        return f"{GRAPH_API_BASE}/{self._phone_number_id()}/messages"
 
     def _headers(self) -> dict[str, str]:
+        # Reload .env so a refreshed token is picked up without restarting
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
         return {
-            "Authorization": f"Bearer {self.access_token}",
+            "Authorization": f"Bearer {os.getenv('WHATSAPP_ACCESS_TOKEN', '')}",
             "Content-Type": "application/json",
         }
 
@@ -92,7 +100,7 @@ class WhatsAppClient:
         return await self._send(payload, to)
 
     async def send_location_request(self, to: str, body: str) -> bool:
-        """Request the user's location using WhatsApp location message type."""
+        """Request the user's location using WhatsApp interactive location message."""
         payload = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -110,12 +118,12 @@ class WhatsAppClient:
         """Execute the API call. Logs on failure but never raises."""
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(self.base_url, json=payload, headers=self._headers())
+                resp = await client.post(self._base_url(), json=payload, headers=self._headers())
                 if resp.status_code not in (200, 201):
                     logger.error(
                         "whatsapp_send_failed",
                         status=resp.status_code,
-                        body=resp.text[:200],
+                        body=resp.text[:300],
                         to=to[-4:],
                     )
                     return False

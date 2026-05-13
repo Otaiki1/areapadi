@@ -30,7 +30,7 @@ from shared.models import VALID_TRANSITIONS
 from models import Order
 from schemas import (
     CreateOrderRequest, UpdateStatusRequest, PaymentUpdateRequest,
-    CancelOrderRequest, RateOrderRequest,
+    CancelOrderRequest, RateOrderRequest, AssignRiderRequest,
 )
 
 logger = get_logger("order-service")
@@ -38,6 +38,7 @@ logger = get_logger("order-service")
 RIDER_DISPATCH_URL = os.getenv("RIDER_DISPATCH_URL", "http://localhost:8004")
 AI_AGENT_URL = os.getenv("AI_AGENT_URL", "http://localhost:8001")
 SELLER_SERVICE_URL = os.getenv("SELLER_SERVICE_URL", "http://localhost:8002")
+RATING_ENGINE_URL = os.getenv("RATING_ENGINE_URL", "http://localhost:8005")
 
 scheduler = AsyncIOScheduler()
 
@@ -89,7 +90,7 @@ def _validate_transition(current: str, target: str) -> None:
 
 
 @app.post("/orders", status_code=201)
-async def create_order(req: CreateOrderRequest, db: AsyncSession = Depends(get_db)):
+async def create_order(req: CreateOrderRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     """
     Create a new order in 'pending' status.
     Schedules a 10-minute check for seller no-show protection.
@@ -128,6 +129,16 @@ async def create_order(req: CreateOrderRequest, db: AsyncSession = Depends(get_d
         args=[order_id, seller_id],
         id=f"noshow_{order_id}",
         replace_existing=True,
+    )
+
+    # Notify seller of the new order
+    background_tasks.add_task(
+        _notify_seller,
+        seller_id,
+        order_id,
+        [item.model_dump() for item in req.items],
+        float(req.total_amount),
+        req.buyer_notes,
     )
 
     logger.info("order_created", order_id=order_id, seller_id=seller_id)
@@ -227,7 +238,7 @@ async def update_payment(order_id: str, req: PaymentUpdateRequest, db: AsyncSess
 
 
 @app.post("/orders/{order_id}/confirm-seller")
-async def seller_confirm(order_id: str, db: AsyncSession = Depends(get_db)):
+async def seller_confirm(order_id: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     """Seller confirmed the order. Transitions pending -> confirmed."""
     result = await db.execute(select(Order).where(Order.id == order_id))
     order = result.scalar_one_or_none()
@@ -238,6 +249,7 @@ async def seller_confirm(order_id: str, db: AsyncSession = Depends(get_db)):
     order.status = "confirmed"
     await db.flush()
     logger.info("order_confirmed_by_seller", order_id=order_id)
+    background_tasks.add_task(_notify_buyer_status, order_id, "confirmed")
     return JSONResponse(order_to_dict(order))
 
 
@@ -257,6 +269,7 @@ async def food_ready(order_id: str, background_tasks: BackgroundTasks, db: Async
     await db.flush()
 
     background_tasks.add_task(_trigger_rider_dispatch, order_id)
+    background_tasks.add_task(_notify_buyer_status, order_id, "food_ready")
     logger.info("food_ready", order_id=order_id)
     return JSONResponse(order_to_dict(order))
 
@@ -275,8 +288,25 @@ async def _trigger_rider_dispatch(order_id: str) -> None:
         logger.error("rider_dispatch_exception", error=str(exc), order_id=order_id)
 
 
+@app.post("/orders/{order_id}/assign-rider")
+async def assign_rider(order_id: str, req: AssignRiderRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    """Called by Rider Dispatch when a rider accepts. Transitions food_ready -> rider_assigned."""
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    _validate_transition(order.status, "rider_assigned")
+    order.status = "rider_assigned"
+    order.rider_id = uuid.UUID(req.rider_id)
+    await db.flush()
+    logger.info("rider_assigned", order_id=order_id, rider_id=req.rider_id)
+    background_tasks.add_task(_notify_buyer_status, order_id, "rider_assigned")
+    return JSONResponse(order_to_dict(order))
+
+
 @app.post("/orders/{order_id}/rider-pickup")
-async def rider_pickup(order_id: str, db: AsyncSession = Depends(get_db)):
+async def rider_pickup(order_id: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     """Rider confirmed pickup. Transitions rider_assigned -> picked_up."""
     result = await db.execute(select(Order).where(Order.id == order_id))
     order = result.scalar_one_or_none()
@@ -287,6 +317,7 @@ async def rider_pickup(order_id: str, db: AsyncSession = Depends(get_db)):
     order.status = "picked_up"
     await db.flush()
     logger.info("rider_pickup_confirmed", order_id=order_id)
+    background_tasks.add_task(_notify_buyer_status, order_id, "picked_up")
     return JSONResponse(order_to_dict(order))
 
 
@@ -305,6 +336,7 @@ async def delivery_confirm(order_id: str, background_tasks: BackgroundTasks, db:
     order.status = "delivered"
     await db.flush()
 
+    background_tasks.add_task(_notify_buyer_status, order_id, "delivered")
     background_tasks.add_task(_send_rating_prompt, order_id)
     logger.info("delivery_confirmed", order_id=order_id)
     return JSONResponse(order_to_dict(order))
@@ -320,6 +352,47 @@ async def _send_rating_prompt(order_id: str) -> None:
             )
     except Exception as exc:
         logger.error("rating_prompt_failed", error=str(exc), order_id=order_id)
+
+
+async def _notify_buyer_status(order_id: str, status: str, rider_name: str | None = None) -> None:
+    """Push a status update to the buyer via AI Agent."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{AI_AGENT_URL}/notify-buyer",
+                json={"order_id": order_id, "status": status, "rider_name": rider_name},
+            )
+    except Exception as exc:
+        logger.error("notify_buyer_failed", error=str(exc), order_id=order_id, status=status)
+
+
+async def _notify_seller(
+    seller_id: str, order_id: str, items: list, total: float, buyer_notes: str | None
+) -> None:
+    """Look up seller phone then push a new-order notification via AI Agent."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            seller_resp = await client.get(f"{SELLER_SERVICE_URL}/sellers/{seller_id}")
+            if seller_resp.status_code != 200:
+                logger.error("notify_seller_lookup_failed", seller_id=seller_id, status=seller_resp.status_code)
+                return
+            phone = seller_resp.json().get("phone_number", "")
+            if not phone:
+                logger.error("notify_seller_no_phone", seller_id=seller_id)
+                return
+
+            await client.post(
+                f"{AI_AGENT_URL}/notify-seller",
+                json={
+                    "order_id": order_id,
+                    "seller_phone": phone,
+                    "items": items,
+                    "total": total,
+                    "buyer_notes": buyer_notes,
+                },
+            )
+    except Exception as exc:
+        logger.error("notify_seller_failed", error=str(exc), seller_id=seller_id, order_id=order_id)
 
 
 @app.post("/orders/{order_id}/cancel")

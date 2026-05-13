@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import DeclarativeBase
 
 
-DATABASE_URL = (
+DATABASE_URL = os.getenv("DATABASE_URL") or (
     f"postgresql+asyncpg://"
     f"{os.getenv('POSTGRES_USER', 'areapadi_user')}:"
     f"{os.getenv('POSTGRES_PASSWORD', 'devpassword')}@"

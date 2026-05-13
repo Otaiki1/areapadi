@@ -15,22 +15,17 @@ Stages:
   awaiting_rating  → delivered, prompting 1-5 rating
 """
 from __future__ import annotations
-import os
 import math
+import os
 import httpx
-from datetime import datetime, timezone
-from sqlalchemy import select, text as sa_text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy import text as sa_text
 
 from shared.models import ConversationState, MessagePayload
 from shared.redis_client import save_conversation_state
 from shared.whatsapp_client import get_whatsapp_client
 from shared.db import AsyncSessionLocal
 from shared.logger import get_logger
-
-from claude_client import call_claude_json, HAIKU, SONNET
-from prompts import BUYER_IDLE, ORDER_PARSER, CONFIRMATION_CHECK
-from db_models import Buyer
 
 logger = get_logger("buyer-handler")
 
@@ -66,7 +61,6 @@ async def handle_buyer_message(
     elif stage == "awaiting_rating":
         await _handle_awaiting_rating(state, message, wa)
     else:
-        # Catch-all: reset to idle if they have a location
         if state.location_lat:
             state.stage = "idle"
             await save_conversation_state(state)
@@ -74,7 +68,10 @@ async def handle_buyer_message(
         else:
             state.stage = "awaiting_location"
             await save_conversation_state(state)
-            await wa.send_location_request(state.phone_number, "Please share your location so I can find sellers near you.")
+            await wa.send_location_request(
+                state.phone_number,
+                "Please share your location so I can find sellers near you.",
+            )
 
 
 # ── Stage handlers ────────────────────────────────────────────────────────────
@@ -94,17 +91,16 @@ async def _handle_awaiting_location(
     state.location_lng = lng
     state.stage = "idle"
 
-    # Save location to buyers table in the background (best effort)
-    await _update_buyer_location(state.phone_number, lat, lng)
+    # Persist buyer to DB immediately — create if new, update location if returning
+    await _upsert_buyer(state.phone_number, message.whatsapp_name, lat, lng)
 
-    # Reverse geocode for a friendly area name
     area_name = await _get_area_name(lat, lng)
     await save_conversation_state(state)
 
     await wa.send_text(
         state.phone_number,
         f"Location saved — {area_name}!\n\nWhat food are you looking for? "
-        "You can say things like 'jollof rice', 'shawarma near me', or 'small chops'.",
+        "You can say things like *jollof rice*, *shawarma*, or *small chops*.",
     )
 
 
@@ -114,11 +110,11 @@ async def _handle_idle(
     phone = state.phone_number
 
     if message.message_type == "location":
-        # Buyer re-shared location — update it
-        state.location_lat = message.location_lat
-        state.location_lng = message.location_lng
-        await _update_buyer_location(phone, message.location_lat, message.location_lng)
-        area_name = await _get_area_name(message.location_lat, message.location_lng)
+        lat, lng = message.location_lat, message.location_lng
+        state.location_lat = lat
+        state.location_lng = lng
+        await _upsert_buyer(phone, None, lat, lng)
+        area_name = await _get_area_name(lat, lng)
         await save_conversation_state(state)
         await wa.send_text(phone, f"Location updated to {area_name}. What food are you looking for?")
         return
@@ -127,36 +123,24 @@ async def _handle_idle(
         await wa.send_text(phone, "What food are you looking for? Just type it.")
         return
 
-    parsed = await call_claude_json(
-        BUYER_IDLE,
-        message.text,
-        model=HAIKU,
-        history=state.message_history[-6:],
-    )
-    if not parsed:
-        await wa.send_text(phone, "I didn't catch that. What food would you like?")
-        return
+    text = message.text.strip().lower()
 
-    intent = parsed.get("intent", "off_topic")
-    reply_text = parsed.get("reply_text", "")
-
-    if intent == "order_status":
+    if any(w in text for w in ("status", "my order", "where is", "order status")):
         await _send_order_status(state, phone, wa)
         return
 
-    if intent in ("help", "off_topic"):
-        if reply_text:
-            await wa.send_text(phone, reply_text)
-        else:
-            await wa.send_text(phone, "I can help you find and order food nearby. Just tell me what you want to eat!")
+    non_food = (
+        "hi", "hello", "hey", "i want to order", "order food", "i want food",
+        "want to order", "i want to buy", "help", "menu", "what can you do",
+    )
+    if text in non_food or text.startswith("i want to order") or text.startswith("i want food"):
+        await wa.send_text(
+            phone,
+            "What food are you looking for? E.g. *shawarma*, *jollof rice*, *small chops*",
+        )
         return
 
-    # food_search
-    food_query = parsed.get("food_query", message.text)
-    if reply_text:
-        await wa.send_text(phone, reply_text)
-
-    await _search_and_present_sellers(state, phone, food_query, wa)
+    await _search_and_present_sellers(state, phone, message.text.strip(), wa)
 
 
 async def _handle_browsing(
@@ -164,11 +148,9 @@ async def _handle_browsing(
 ) -> None:
     phone = state.phone_number
 
-    # User may reply with text if they didn't use the list
     seller_id = message.interactive_id
     if not seller_id and message.text:
         text = message.text.strip()
-        # Allow them to re-search
         if len(text) > 3:
             await _search_and_present_sellers(state, phone, text, wa)
             return
@@ -185,11 +167,17 @@ async def _handle_browsing(
 async def _handle_viewing_menu(
     state: ConversationState, message: MessagePayload, wa
 ) -> None:
+    """
+    Numbered menu selection.
+    • "1"     → add 1 of item 1
+    • "2 x3"  → add 3 of item 2
+    • "done"  → proceed to checkout
+    • "cart"  → show current cart
+    • "clear" → empty cart, back to idle
+    """
+    import re
     phone = state.phone_number
-
-    if not message.text:
-        await wa.send_text(phone, "Tell me what you want to order. E.g. '2 jollof rice and 1 chicken'")
-        return
+    text = (message.text or "").strip().lower()
 
     seller_id = state.active_seller_id
     if not seller_id:
@@ -198,72 +186,91 @@ async def _handle_viewing_menu(
         await wa.send_text(phone, "Something went wrong. What food are you looking for?")
         return
 
-    # Fetch menu items
     menu_items = await _fetch_menu(seller_id)
     if not menu_items:
-        await wa.send_text(phone, "Sorry, could not load the menu. Please try selecting the seller again.")
+        await wa.send_text(phone, "Could not load the menu. Please try selecting the seller again.")
         return
 
-    menu_text = "\n".join(
-        f"• {item['name']} — ₦{item['price']:,.0f}" + (f" ({item['description']})" if item.get("description") else "")
-        for item in menu_items
-    )
-    user_prompt = f"Menu:\n{menu_text}\n\nBuyer says: {message.text}"
+    cart: list[dict] = state.pending_items or []
 
-    parsed = await call_claude_json(
-        ORDER_PARSER,
-        user_prompt,
-        model=SONNET,
-        max_tokens=1024,
-    )
-    if not parsed or not parsed.get("items"):
-        reply = parsed.get("reply_text") if parsed else None
-        await wa.send_text(phone, reply or "I didn't understand your order. Try: '2 jollof rice and 1 chicken'")
+    if text in ("done", "order", "checkout", "proceed", "confirm"):
+        if not cart:
+            await wa.send_text(phone, "Your cart is empty. Send a number from the menu to add an item.")
+            return
+        await _show_order_summary(state, phone, cart, wa)
         return
 
-    items = parsed["items"]
-    if parsed.get("confidence") == "low":
-        await wa.send_text(phone, parsed.get("reply_text", "Can you clarify your order?"))
+    if text in ("cart", "my cart", "show cart"):
+        if not cart:
+            await wa.send_text(phone, "Your cart is empty.")
+        else:
+            lines = "\n".join(f"• {it['name']} x{it['quantity']} — ₦{it['subtotal']:,.0f}" for it in cart)
+            await wa.send_text(phone, f"Your cart:\n{lines}\n\nSend more numbers to add items, or *done* to order.")
         return
 
-    # Validate items against actual menu prices
-    menu_price_map = {item["name"].lower(): item for item in menu_items}
-    validated = []
-    for it in items:
-        menu_item = menu_price_map.get(it["name"].lower())
-        if menu_item:
-            qty = max(1, int(it.get("quantity", 1)))
-            unit_price = float(menu_item["price"])
-            validated.append({
-                "name": menu_item["name"],
-                "quantity": qty,
-                "unit_price": unit_price,
-                "subtotal": round(qty * unit_price, 2),
-            })
+    if text in ("clear", "cancel", "restart", "reset", "back"):
+        state.pending_items = None
+        state.stage = "idle"
+        await save_conversation_state(state)
+        await wa.send_text(phone, "Cart cleared. What food are you looking for?")
+        return
 
-    if not validated:
-        unmatched = parsed.get("unmatched", [])
+    match = re.match(r"^(\d+)(?:\s*[xX\*]\s*(\d+))?$", text)
+    if not match:
         await wa.send_text(
             phone,
-            f"I couldn't find those items on the menu.\n"
-            f"Not found: {', '.join(unmatched) if unmatched else 'unknown items'}\n\n"
-            "Please check the menu and try again.",
+            "Send the item number to add it to your cart.\n"
+            "Example: *1* to add item 1, or *2 x3* for 3 of item 2.\n\n"
+            "Send *cart* to see your order, *done* to checkout, *clear* to start over.",
         )
         return
 
-    subtotal = sum(it["subtotal"] for it in validated)
+    item_num = int(match.group(1))
+    quantity = int(match.group(2)) if match.group(2) else 1
 
-    # Get delivery fee from geo-service
-    delivery_fee = await _get_delivery_fee(state, seller_id)
+    if item_num < 1 or item_num > len(menu_items):
+        await wa.send_text(phone, f"Please send a number between 1 and {len(menu_items)}.")
+        return
 
-    total = subtotal + delivery_fee
-    state.pending_items = validated
+    selected = menu_items[item_num - 1]
+    unit_price = float(selected["price"])
+
+    existing = next((it for it in cart if it["name"] == selected["name"]), None)
+    if existing:
+        existing["quantity"] += quantity
+        existing["subtotal"] = round(existing["quantity"] * unit_price, 2)
+    else:
+        cart.append({
+            "name": selected["name"],
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "subtotal": round(quantity * unit_price, 2),
+        })
+
+    state.pending_items = cart
+    await save_conversation_state(state)
+
+    total_so_far = sum(it["subtotal"] for it in cart)
+    await wa.send_text(
+        phone,
+        f"Added: {selected['name']} x{quantity} — ₦{quantity * unit_price:,.0f}\n"
+        f"Cart total: ₦{total_so_far:,.0f} ({len(cart)} item{'s' if len(cart) != 1 else ''})\n\n"
+        "Add more items or send *done* to checkout.",
+    )
+
+
+async def _show_order_summary(
+    state: ConversationState, phone: str, cart: list[dict], wa
+) -> None:
+    subtotal = sum(it["subtotal"] for it in cart)
+    delivery_fee = await _get_delivery_fee(state, state.active_seller_id)
+    total = round(subtotal + delivery_fee, 2)
+
+    state.pending_items = cart
     state.stage = "building_order"
     await save_conversation_state(state)
 
-    lines = "\n".join(
-        f"{it['name']} x{it['quantity']} — ₦{it['subtotal']:,.0f}" for it in validated
-    )
+    lines = "\n".join(f"{it['name']} x{it['quantity']} — ₦{it['subtotal']:,.0f}" for it in cart)
     await wa.send_interactive_buttons(
         phone,
         f"Your order:\n{lines}\n\n"
@@ -273,7 +280,7 @@ async def _handle_viewing_menu(
         "Confirm to place this order?",
         buttons=[
             {"id": "confirm_order", "title": "Confirm"},
-            {"id": "cancel_order", "title": "Cancel"},
+            {"id": "cancel_order",  "title": "Cancel"},
         ],
     )
 
@@ -283,43 +290,34 @@ async def _handle_building_order(
 ) -> None:
     phone = state.phone_number
 
-    # Handle interactive button
-    if message.interactive_id == "confirm_order" or (
-        message.message_type == "text" and
-        any(w in (message.text or "").lower() for w in ("confirm", "yes", "ok", "okay", "oya", "go ahead"))
-    ):
+    confirmed = message.interactive_id == "confirm_order" or any(
+        w in (message.text or "").lower()
+        for w in ("confirm", "yes", "ok", "okay", "oya", "go ahead")
+    )
+    cancelled = message.interactive_id == "cancel_order" or any(
+        w in (message.text or "").lower()
+        for w in ("cancel", "no", "stop")
+    )
+
+    if confirmed:
         await _place_order(state, phone, wa)
         return
 
-    if message.interactive_id == "cancel_order" or (
-        message.message_type == "text" and
-        any(w in (message.text or "").lower() for w in ("cancel", "no", "stop"))
-    ):
+    if cancelled:
         state.stage = "idle"
         state.pending_items = None
         await save_conversation_state(state)
         await wa.send_text(phone, "Order cancelled. What else can I help you find?")
         return
 
-    # Let Claude decide
-    parsed = await call_claude_json(CONFIRMATION_CHECK, message.text or "", model=HAIKU)
-    if parsed.get("confirmed"):
-        await _place_order(state, phone, wa)
-    elif parsed.get("wants_cancel"):
-        state.stage = "idle"
-        state.pending_items = None
-        await save_conversation_state(state)
-        await wa.send_text(phone, "Order cancelled. What else can I get you?")
-    else:
-        # They want to change something — go back to menu view
-        state.stage = "viewing_menu"
-        state.pending_items = None
-        await save_conversation_state(state)
-        reply = parsed.get("reply_text", "")
-        await wa.send_text(
-            phone,
-            (reply + "\n\n" if reply else "") + "Tell me your updated order.",
-        )
+    await wa.send_interactive_buttons(
+        phone,
+        "Please confirm or cancel your order:",
+        buttons=[
+            {"id": "confirm_order", "title": "Confirm"},
+            {"id": "cancel_order",  "title": "Cancel"},
+        ],
+    )
 
 
 async def _handle_awaiting_payment(
@@ -329,7 +327,6 @@ async def _handle_awaiting_payment(
     text = (message.text or "").lower().strip()
 
     if text in ("pay", "link", "payment", "send link", "resend"):
-        # Re-fetch and resend payment link
         order_id = state.active_order_id
         if not order_id:
             state.stage = "idle"
@@ -340,7 +337,8 @@ async def _handle_awaiting_payment(
     else:
         await wa.send_text(
             phone,
-            "Your payment link was sent above. Reply 'pay' if you need a new link.",
+            "Your payment link was sent above. Complete the payment to confirm your order.\n\n"
+            "Reply *pay* if you need a fresh link.",
         )
 
 
@@ -348,9 +346,7 @@ async def _handle_order_in_progress(
     state: ConversationState, message: MessagePayload, wa
 ) -> None:
     phone = state.phone_number
-    order_id = state.active_order_id
-
-    if not order_id:
+    if not state.active_order_id:
         state.stage = "idle"
         await save_conversation_state(state)
         await wa.send_text(phone, "What food are you looking for?")
@@ -358,7 +354,7 @@ async def _handle_order_in_progress(
 
     stage_messages = {
         "order_confirmed": "Your order is confirmed and being prepared. We'll notify you when the rider picks it up.",
-        "awaiting_pickup": "Your food is ready and we're arranging pickup. Hang tight!",
+        "awaiting_pickup": "Your food is ready and a rider has been arranged. Hang tight!",
         "in_delivery": "Your rider is on the way. You'll get a message when it arrives.",
     }
     await wa.send_text(phone, stage_messages.get(state.stage, "Your order is being processed. Please wait."))
@@ -376,22 +372,20 @@ async def _handle_awaiting_rating(
         return
 
     rating = int(text)
-    delivery_rating = state.onboarding_data.get("pending_food_rating") if state.onboarding_data else None
+    pending_food = (state.onboarding_data or {}).get("pending_food_rating")
 
-    if delivery_rating is None:
-        # First rating received = food rating
+    if pending_food is None:
         state.onboarding_data = state.onboarding_data or {}
         state.onboarding_data["pending_food_rating"] = rating
         await save_conversation_state(state)
         await wa.send_text(phone, f"Food rating: {rating}/5. Now rate your delivery (1–5):")
         return
 
-    # Second rating = delivery rating, submit both
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             await client.post(
                 f"{ORDER_SERVICE_URL}/orders/{order_id}/rate",
-                json={"food_rating": delivery_rating, "delivery_rating": rating},
+                json={"food_rating": pending_food, "delivery_rating": rating},
             )
     except Exception as exc:
         logger.error("submit_rating_failed", error=str(exc), order_id=order_id)
@@ -421,11 +415,14 @@ async def send_rating_prompt(order_id: str) -> None:
             return
 
         async with AsyncSessionLocal() as session:
-            result = await session.execute(select(Buyer).where(Buyer.id == buyer_id))
-            buyer = result.scalar_one_or_none()
-            if not buyer:
+            result = await session.execute(
+                sa_text("SELECT phone_number FROM buyers WHERE id = :id::uuid"),
+                {"id": buyer_id},
+            )
+            row = result.fetchone()
+            if not row:
                 return
-            phone = buyer.phone_number
+            phone = row[0]
 
         from shared.redis_client import get_conversation_state
         state = await get_conversation_state(phone)
@@ -477,7 +474,6 @@ async def _search_and_present_sellers(
         )
         return
 
-    # Store seller IDs in state for validation
     state.onboarding_data = state.onboarding_data or {}
     state.onboarding_data["last_search_seller_ids"] = [s["id"] for s in sellers]
     state.stage = "browsing"
@@ -497,7 +493,8 @@ async def _search_and_present_sellers(
         }
     ]
 
-    header = f"Found {len(sellers[:4])} seller{'s' if len(sellers[:4]) != 1 else ''} for '{food_query}':"
+    count = len(sellers[:4])
+    header = f"Found {count} seller{'s' if count != 1 else ''} for '{food_query}':"
     await wa.send_interactive_list(phone, header, sections)
 
 
@@ -512,8 +509,7 @@ def _seller_row_desc(seller: dict) -> str:
     samples = seller.get("sample_items", [])[:2]
     if samples:
         parts.append(", ".join(samples))
-    desc = " · ".join(parts)
-    return desc[:72]  # WhatsApp row description limit
+    return " · ".join(parts)[:72]
 
 
 async def _show_menu(
@@ -526,6 +522,7 @@ async def _show_menu(
 
     state.active_seller_id = seller_id
     state.stage = "viewing_menu"
+    state.pending_items = []
     await save_conversation_state(state)
 
     lines = []
@@ -536,7 +533,8 @@ async def _show_menu(
 
     await wa.send_text(
         phone,
-        "Here's the menu:\n\n" + "\n".join(lines) + "\n\nWhat would you like to order?",
+        "Here's the menu:\n\n" + "\n".join(lines) + "\n\n"
+        "Reply with an item number to add it to your cart. E.g. *1* or *2 x3* for 3 of item 2.",
     )
 
 
@@ -555,7 +553,7 @@ async def _place_order(state: ConversationState, phone: str, wa) -> None:
 
     subtotal = sum(it["subtotal"] for it in items)
     delivery_fee = await _get_delivery_fee(state, state.active_seller_id)
-    commission = round(subtotal * 0.05, 2)  # 5% platform commission on food
+    commission = round(subtotal * 0.05, 2)
     total = round(subtotal + delivery_fee, 2)
 
     try:
@@ -573,6 +571,7 @@ async def _place_order(state: ConversationState, phone: str, wa) -> None:
                     "total_amount": total,
                     "delivery_lat": state.location_lat,
                     "delivery_lng": state.location_lng,
+                    "buyer_phone": phone,
                 },
             )
             if order_resp.status_code != 201:
@@ -581,7 +580,6 @@ async def _place_order(state: ConversationState, phone: str, wa) -> None:
             order = order_resp.json()
             order_id = order["id"]
 
-            # Generate Paystack link
             pay_resp = await client.post(
                 f"{PAYMENT_SERVICE_URL}/initialize",
                 json={
@@ -595,8 +593,7 @@ async def _place_order(state: ConversationState, phone: str, wa) -> None:
             if pay_resp.status_code != 200:
                 raise Exception(f"Payment init failed: {pay_resp.status_code}")
 
-            payment_data = pay_resp.json()
-            pay_url = payment_data["authorization_url"]
+            pay_url = pay_resp.json()["authorization_url"]
 
         state.active_order_id = order_id
         state.stage = "awaiting_payment"
@@ -606,7 +603,7 @@ async def _place_order(state: ConversationState, phone: str, wa) -> None:
         await wa.send_text(
             phone,
             f"Order placed! Pay ₦{total:,.0f} to confirm:\n\n{pay_url}\n\n"
-            "The link is valid for 30 minutes. Reply 'pay' if you need a new one.",
+            "The link is valid for 30 minutes. Reply *pay* if you need a new one.",
         )
 
     except Exception as exc:
@@ -620,8 +617,7 @@ async def _resend_payment_link(phone: str, order_id: str, state: ConversationSta
             order_resp = await client.get(f"{ORDER_SERVICE_URL}/orders/{order_id}")
             if order_resp.status_code != 200:
                 raise Exception("Order not found")
-            order = order_resp.json()
-            total = order["total_amount"]
+            total = order_resp.json()["total_amount"]
 
             pay_resp = await client.post(
                 f"{PAYMENT_SERVICE_URL}/initialize",
@@ -643,23 +639,22 @@ async def _resend_payment_link(phone: str, order_id: str, state: ConversationSta
 async def _send_order_status(state: ConversationState, phone: str, wa) -> None:
     order_id = state.active_order_id
     if not order_id:
-        await wa.send_text(phone, "You don't have an active order right now. What food are you looking for?")
+        await wa.send_text(phone, "You don't have an active order. What food are you looking for?")
         return
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(f"{ORDER_SERVICE_URL}/orders/{order_id}")
         if resp.status_code != 200:
             raise Exception("Order not found")
-        order = resp.json()
-        status = order["status"]
+        status = resp.json()["status"]
         status_messages = {
-            "pending": "Your order is waiting for the seller to confirm.",
-            "confirmed": "The seller confirmed your order and is preparing it.",
-            "food_ready": "Your food is ready! A rider is on the way to pick it up.",
-            "rider_assigned": "A rider has been assigned and is heading to pick up your food.",
-            "picked_up": "Your rider has picked up your food and is on the way to you!",
-            "delivered": "Your order was delivered.",
-            "cancelled": f"Your order was cancelled. Reason: {order.get('cancelled_reason', 'unknown')}",
+            "pending":         "Your order is waiting for the seller to confirm.",
+            "confirmed":       "The seller confirmed your order and is preparing it.",
+            "food_ready":      "Your food is ready! A rider is on the way to pick it up.",
+            "rider_assigned":  "A rider has been assigned and is heading to pick up your food.",
+            "picked_up":       "Your rider has your food and is heading to you!",
+            "delivered":       "Your order was delivered. Enjoy!",
+            "cancelled":       "Your order was cancelled.",
         }
         await wa.send_text(phone, status_messages.get(status, f"Order status: {status}"))
     except Exception as exc:
@@ -678,28 +673,70 @@ async def _fetch_menu(seller_id: str) -> list[dict]:
     return []
 
 
+async def _get_seller_coords(seller_id: str) -> tuple[float, float] | None:
+    """Return (lat, lng) for a seller by querying PostGIS directly."""
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                sa_text("""
+                    SELECT ST_Y(location::geometry), ST_X(location::geometry)
+                    FROM sellers WHERE id = :id::uuid
+                """),
+                {"id": seller_id},
+            )
+            row = result.fetchone()
+            if row and row[0] is not None:
+                return float(row[0]), float(row[1])
+    except Exception as exc:
+        logger.error("get_seller_coords_failed", error=str(exc))
+    return None
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Straight-line distance between two GPS coordinates in km."""
+    R = 6371
+    d_lat = math.radians(lat2 - lat1)
+    d_lng = math.radians(lng2 - lng1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lng / 2) ** 2
+    )
+    return R * 2 * math.asin(math.sqrt(a))
+
+
 async def _get_delivery_fee(state: ConversationState, seller_id: str | None) -> float:
-    """Estimate delivery fee. Falls back to flat ₦550 if geo is unavailable."""
+    """Calculate delivery fee using real buyer-to-seller distance."""
     if not state.location_lat or not seller_id:
         return 550.0
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            seller_resp = await client.get(f"{SELLER_SERVICE_URL}/sellers/{seller_id}")
-            if seller_resp.status_code != 200:
-                return 550.0
-    except Exception:
+
+    seller_coords = await _get_seller_coords(seller_id)
+    if not seller_coords:
         return 550.0
+
+    seller_lat, seller_lng = seller_coords
+    dist_km = _haversine_km(
+        state.location_lat, state.location_lng,
+        seller_lat, seller_lng,
+    )
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            fee_resp = await client.post(
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
                 f"{GEO_SERVICE_URL}/delivery-fee",
-                json={"distance_km": 2.0},  # default estimate; real distance needs seller coords
+                json={"distance_km": dist_km},
             )
-            if fee_resp.status_code == 200:
-                return float(fee_resp.json().get("total_fee", 550))
+            if resp.status_code == 200:
+                return float(resp.json().get("total_fee", 550))
     except Exception:
         pass
-    return 550.0
+
+    # Inline fallback matching geo service fare schedule
+    if dist_km <= 3:
+        return 550.0
+    elif dist_km <= 6:
+        return 950.0
+    else:
+        return round(950 + (dist_km - 6) * 100)
 
 
 async def _get_area_name(lat: float, lng: float) -> str:
@@ -716,41 +753,64 @@ async def _get_area_name(lat: float, lng: float) -> str:
     return "your area"
 
 
-async def _update_buyer_location(phone: str, lat: float, lng: float) -> None:
+async def _upsert_buyer(phone: str, name: str | None, lat: float, lng: float) -> None:
+    """Create buyer if new, update location always. Saves whatsapp_name if provided."""
     try:
         async with AsyncSessionLocal() as session:
             await session.execute(
                 sa_text("""
-                    UPDATE buyers
-                    SET location = ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
-                        location_updated_at = NOW()
-                    WHERE phone_number = :phone
+                    INSERT INTO buyers (phone_number, whatsapp_name, location, location_updated_at)
+                    VALUES (
+                        :phone, :name,
+                        ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
+                        NOW()
+                    )
+                    ON CONFLICT (phone_number) DO UPDATE
+                      SET location             = EXCLUDED.location,
+                          location_updated_at  = NOW(),
+                          whatsapp_name        = COALESCE(EXCLUDED.whatsapp_name, buyers.whatsapp_name)
                 """),
-                {"lng": lng, "lat": lat, "phone": phone},
+                {"phone": phone, "name": name, "lat": lat, "lng": lng},
             )
             await session.commit()
     except Exception as exc:
-        logger.error("update_buyer_location_failed", error=str(exc))
+        logger.error("upsert_buyer_failed", error=str(exc))
 
 
 async def _get_or_create_buyer_id(phone: str, state: ConversationState) -> str | None:
+    """Return buyer's UUID string, inserting a record if none exists yet."""
     try:
         async with AsyncSessionLocal() as session:
-            result = await session.execute(select(Buyer).where(Buyer.phone_number == phone))
-            buyer = result.scalar_one_or_none()
-            if not buyer:
-                buyer = Buyer(
-                    phone_number=phone,
-                    whatsapp_name=None,
-                    location=(
-                        f"SRID=4326;POINT({state.location_lng} {state.location_lat})"
-                        if state.location_lat else None
-                    ),
-                )
-                session.add(buyer)
-                await session.flush()
-                await session.refresh(buyer)
-            return str(buyer.id)
+            result = await session.execute(
+                sa_text("""
+                    INSERT INTO buyers (
+                        phone_number, location, location_updated_at
+                    )
+                    VALUES (
+                        :phone,
+                        CASE WHEN :lat IS NOT NULL
+                             THEN ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography
+                             ELSE NULL END,
+                        CASE WHEN :lat IS NOT NULL THEN NOW() ELSE NULL END
+                    )
+                    ON CONFLICT (phone_number) DO UPDATE
+                      SET location = CASE WHEN :lat IS NOT NULL
+                                          THEN EXCLUDED.location
+                                          ELSE buyers.location END,
+                          location_updated_at = CASE WHEN :lat IS NOT NULL
+                                                     THEN NOW()
+                                                     ELSE buyers.location_updated_at END
+                    RETURNING id::text
+                """),
+                {
+                    "phone": phone,
+                    "lat": state.location_lat,
+                    "lng": state.location_lng,
+                },
+            )
+            row = result.fetchone()
+            await session.commit()
+            return row[0] if row else None
     except Exception as exc:
         logger.error("get_or_create_buyer_failed", error=str(exc))
         return None

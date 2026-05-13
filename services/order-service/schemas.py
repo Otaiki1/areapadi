@@ -45,6 +45,10 @@ class RateOrderRequest(BaseModel):
     delivery_rating: int = Field(ge=1, le=5)
 
 
+class AssignRiderRequest(BaseModel):
+    rider_id: str
+
+
 class OrderResponse(BaseModel):
     id: str
     buyer_id: str | None
