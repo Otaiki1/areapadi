@@ -105,7 +105,13 @@ def parse_whatsapp_message(body: dict) -> MessagePayload | None:
                 payload.interactive_title = reply.get("title")
 
         elif msg_type == "image":
-            payload.text = "__image__"
+            img = msg.get("image", {})
+            payload.media_id = img.get("id")
+            payload.media_mime_type = img.get("mime_type", "image/jpeg")
+            # Include caption as text if seller sent one alongside the photo
+            caption = img.get("caption", "").strip()
+            if caption:
+                payload.text = caption
 
         return payload
 
@@ -181,14 +187,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks) -
         phone=hash_phone(payload.phone_number),
         type=payload.message_type,
     )
-
-    if payload.message_type == "image":
-        wa = get_whatsapp_client()
-        await wa.send_text(
-            payload.phone_number,
-            "Hi! I can only read text messages for now. Please type what you'd like to order.",
-        )
-        return JSONResponse({"status": "ok"})
 
     background_tasks.add_task(forward_to_ai_agent, payload)
     return JSONResponse({"status": "ok"})

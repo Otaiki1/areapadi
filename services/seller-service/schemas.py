@@ -63,6 +63,7 @@ class UpdateMenuItemRequest(BaseModel):
     description: str | None = None
     price: Decimal | None = Field(default=None, gt=0)
     is_available: bool | None = None
+    image_url: str | None = None
 
 
 class MenuItemResponse(BaseModel):

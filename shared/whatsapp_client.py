@@ -114,6 +114,36 @@ class WhatsAppClient:
         }
         return await self._send(payload, to)
 
+    async def download_media(self, media_id: str) -> tuple[bytes, str] | None:
+        """Download media from WhatsApp. Returns (bytes, mime_type) or None on failure."""
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+        headers = {"Authorization": f"Bearer {os.getenv('WHATSAPP_ACCESS_TOKEN', '')}"}
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Step 1: resolve media_id → temporary CDN URL
+                meta_resp = await client.get(
+                    f"{GRAPH_API_BASE}/{media_id}",
+                    headers=headers,
+                )
+                if meta_resp.status_code != 200:
+                    logger.error("media_url_fetch_failed", status=meta_resp.status_code, media_id=media_id)
+                    return None
+                data = meta_resp.json()
+                url = data.get("url")
+                mime_type = data.get("mime_type", "image/jpeg")
+                if not url:
+                    return None
+                # Step 2: download the actual bytes
+                img_resp = await client.get(url, headers=headers)
+                if img_resp.status_code != 200:
+                    logger.error("media_download_failed", status=img_resp.status_code)
+                    return None
+                return img_resp.content, mime_type
+        except Exception as exc:
+            logger.error("media_download_exception", error=str(exc), media_id=media_id)
+            return None
+
     async def _send(self, payload: dict, to: str) -> bool:
         """Execute the API call. Logs on failure but never raises."""
         try:

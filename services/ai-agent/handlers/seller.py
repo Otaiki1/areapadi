@@ -12,10 +12,11 @@ Active seller stages:
   seller_active        → receives commands (open/close/add/remove/edit/orders/menu)
   seller_order_pending → new order waiting for confirm/decline
   seller_decline_reason → capture reason before cancelling order
-  seller_adding_item   → looping item entry
-  seller_removing_item → waiting for item number to delete
-  seller_editing_item  → waiting for item number then new price
-  seller_updating_hours → waiting for new hours input
+  seller_adding_item       → looping item entry
+  seller_adding_item_photo → waiting for photo (or skip) after each new item
+  seller_removing_item     → waiting for item number to delete
+  seller_editing_item      → waiting for item number then new price
+  seller_updating_hours    → waiting for new hours input
 """
 from __future__ import annotations
 import re
@@ -80,6 +81,10 @@ async def handle_seller_message(
 
     if stage == "seller_adding_item":
         await _handle_adding_item(state, message, phone, wa)
+        return
+
+    if stage == "seller_adding_item_photo":
+        await _handle_adding_item_photo(state, message, phone, wa)
         return
 
     if stage == "seller_removing_item":
@@ -478,15 +483,100 @@ async def _handle_adding_item(state, message, phone, wa):
                 json={"name": item_name, "price": item_price},
             )
         if resp.status_code in (200, 201):
+            item_id = resp.json().get("id")
+            state.onboarding_data = state.onboarding_data or {}
+            state.onboarding_data["pending_photo_item_id"] = item_id
+            state.onboarding_data["pending_photo_item_name"] = item_name
+            state.stage = "seller_adding_item_photo"
+            await save_conversation_state(state)
             await wa.send_text(
                 phone,
-                f"✓ Added *{item_name}* — ₦{item_price:,.0f}\n\nSend another item or *done* to finish.",
+                f"✓ Added *{item_name}* — ₦{item_price:,.0f}\n\n"
+                "Send a *photo* of this item, or type *skip* to continue without one.\n"
+                "Type *done* to finish adding items.",
             )
         else:
             await wa.send_text(phone, "Could not add that item. Please try again.")
     except Exception as exc:
         logger.error("add_menu_item_failed", error=str(exc))
         await wa.send_text(phone, "Something went wrong. Please try again.")
+
+
+async def _handle_adding_item_photo(state, message, phone, wa):
+    text = (message.text or "").strip().lower()
+    data = state.onboarding_data or {}
+    item_id   = data.get("pending_photo_item_id")
+    item_name = data.get("pending_photo_item_name", "item")
+    seller_id = data.get("seller_id")
+
+    def _clear_photo_state(next_stage: str):
+        data.pop("pending_photo_item_id", None)
+        data.pop("pending_photo_item_name", None)
+        state.onboarding_data = data
+        state.stage = next_stage
+
+    # "done" — skip photo AND stop adding items
+    if text == "done":
+        _clear_photo_state("seller_active")
+        await save_conversation_state(state)
+        await wa.send_text(phone, "Done adding items. Reply *my menu* to see your updated menu.")
+        return
+
+    # "skip" — no photo, loop back for next item
+    if text in ("skip", "no", "next"):
+        _clear_photo_state("seller_adding_item")
+        await save_conversation_state(state)
+        await wa.send_text(phone, "No photo added. Send another item or *done* to finish.")
+        return
+
+    # Expect an image
+    if message.message_type != "image" or not message.media_id:
+        await wa.send_text(
+            phone,
+            f"Please send a *photo* of *{item_name}*.\n\n"
+            "Or type *skip* to continue without a photo, or *done* to finish.",
+        )
+        return
+
+    # Download from WhatsApp
+    result = await get_whatsapp_client().download_media(message.media_id)
+    if not result:
+        await wa.send_text(
+            phone,
+            "Could not download the photo. Please try again, or type *skip* to continue.",
+        )
+        return
+
+    image_bytes, mime_type = result
+
+    # Upload to Supabase Storage
+    from shared.storage import upload_menu_image
+    image_url = await upload_menu_image(image_bytes, item_id, mime_type) if item_id else None
+
+    if image_url and item_id and seller_id:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.patch(
+                    f"{SELLER_SERVICE_URL}/sellers/{seller_id}/menu/{item_id}",
+                    json={"image_url": image_url},
+                )
+        except Exception as exc:
+            logger.error("save_item_image_failed", error=str(exc))
+
+    _clear_photo_state("seller_adding_item")
+    await save_conversation_state(state)
+
+    if image_url:
+        await wa.send_text(
+            phone,
+            f"✓ Photo saved for *{item_name}*!\n\nSend another item or *done* to finish.",
+        )
+    else:
+        await wa.send_text(
+            phone,
+            f"Photo upload failed. *{item_name}* was saved without a photo.\n\n"
+            "Send another item or *done* to finish.",
+        )
 
 
 async def _start_remove_item(state, phone, wa):

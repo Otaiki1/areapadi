@@ -89,6 +89,8 @@ class MessagePayload(BaseModel):
     interactive_id: str | None = None
     interactive_title: str | None = None
     whatsapp_name: str | None = None
+    media_id: str | None = None
+    media_mime_type: str | None = None
     timestamp: int | None = None
 
 
