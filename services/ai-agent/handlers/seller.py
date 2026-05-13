@@ -588,11 +588,17 @@ async def _start_remove_item(state, phone, wa):
         return
 
     state.onboarding_data = state.onboarding_data or {}
-    state.onboarding_data["menu_cache"] = [{"id": it["id"], "name": it["name"]} for it in items]
+    state.onboarding_data["menu_cache"] = [
+        {"id": it["id"], "name": it["name"], "price": it["price"], "image_url": it.get("image_url")}
+        for it in items
+    ]
     state.stage = "seller_removing_item"
     await save_conversation_state(state)
 
-    lines = "\n".join(f"{i+1}. {it['name']} — ₦{it['price']:,.0f}" for i, it in enumerate(items))
+    lines = "\n".join(
+        f"{i+1}. {'📷 ' if it.get('image_url') else ''}{it['name']} — ₦{it['price']:,.0f}"
+        for i, it in enumerate(items)
+    )
     await wa.send_text(
         phone,
         f"Which item do you want to remove?\n\n{lines}\n\nReply with the number or *cancel* to go back.",
@@ -650,12 +656,16 @@ async def _start_edit_item(state, phone, wa):
 
     state.onboarding_data = state.onboarding_data or {}
     state.onboarding_data["menu_cache"] = [
-        {"id": it["id"], "name": it["name"], "price": it["price"]} for it in items
+        {"id": it["id"], "name": it["name"], "price": it["price"], "image_url": it.get("image_url")}
+        for it in items
     ]
     state.stage = "seller_editing_item"
     await save_conversation_state(state)
 
-    lines = "\n".join(f"{i+1}. {it['name']} — ₦{it['price']:,.0f}" for i, it in enumerate(items))
+    lines = "\n".join(
+        f"{i+1}. {'📷 ' if it.get('image_url') else ''}{it['name']} — ₦{it['price']:,.0f}"
+        for i, it in enumerate(items)
+    )
     await wa.send_text(
         phone,
         f"Which item do you want to edit?\n\n{lines}\n\n"
@@ -839,7 +849,7 @@ async def _show_menu(state, phone, wa):
         return
 
     lines = "\n".join(
-        f"{i+1}. {it['name']} — ₦{float(it['price']):,.0f}"
+        f"{i+1}. {'📷 ' if it.get('image_url') else ''}{it['name']} — ₦{float(it['price']):,.0f}"
         for i, it in enumerate(items)
     )
     await wa.send_text(phone, f"*Your Menu ({len(items)} items)*\n\n{lines}")
